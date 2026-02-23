@@ -488,6 +488,25 @@
 
     let currentUser = null;
     let editingRecordId = null;
+    // ฟังก์ชันสำหรับบันทึกประวัติกิจกรรมลง Firebase (ID อ่านง่าย: ชื่อการกระทำ_วัน_เวลา)
+    const logActivity = async (actionName, details) => {
+        const now = new Date();
+        const timestampStr = `${now.getFullYear()}${(now.getMonth()+1).toString().padStart(2,'0')}${now.getDate().toString().padStart(2,'0')}_${now.getHours().toString().padStart(2,'0')}${now.getMinutes().toString().padStart(2,'0')}${now.getSeconds().toString().padStart(2,'0')}`;
+        const userName = currentUser ? currentUser.name.replace(/\s+/g, '_') : "Unknown";
+        
+        // ตั้งชื่อ Document เช่น Add_Training_สมชาย_20260223_143005
+        const docId = `${actionName}_${userName}_${timestampStr}`;
+        
+        try {
+            await setDoc(doc(db, "activity_logs", docId), {
+                action: actionName,
+                user: currentUser ? currentUser.name : "System",
+                details: details,
+                timestamp: now,
+                dateDisplay: now.toLocaleString('th-TH')
+            });
+        } catch (e) { console.error("Log failed:", e); }
+    };
     window.loadedRecords = {}; // เก็บข้อมูลประวัติไว้ในหน่วยความจำชั่วคราวเพื่ออ้างอิงตอนเปิดไฟล์
 
     // ฟังก์ชันแปลงไฟล์เป็น Base64 (เพื่อให้ใช้ฟรีไม่ต้องใช้ Storage)
@@ -601,7 +620,11 @@
             if (!snap.empty) {
                 currentUser = { id: snap.docs[0].id, ...snap.docs[0].data() };
                 document.getElementById('login-pin').value = '';
-                if (currentUser.role === 'admin') { renderAdminDashboard(); navigateTo('view-admin'); }
+                if (currentUser.role === 'admin') { 
+                    await logActivity("Login_Admin", "แอดมินเข้าสู่ระบบ");
+                    renderAdminDashboard(); 
+                    navigateTo('view-admin'); 
+                }
                 else {
                     if (currentUser.isFirstLogin) navigateTo('view-force-pin');
                     else { renderEmployeeDashboard(); navigateTo('view-employee'); }
@@ -621,9 +644,26 @@
         const newPin = document.getElementById('new-pin').value;
         if (newPin !== document.getElementById('confirm-new-pin').value) { showToast('PIN ไม่ตรงกัน', 'error'); return; }
         try {
-            await updateDoc(doc(db, "users", currentUser.id), { pin: newPin, isFirstLogin: false });
-            currentUser.pin = newPin; currentUser.isFirstLogin = false;
-            renderEmployeeDashboard(); navigateTo('view-employee');
+            // 1. ตรวจสอบว่า PIN ใหม่ที่ตั้ง ซ้ำกับคนอื่นในระบบไหม
+            const qPin = query(collection(db, "users"), where("pin", "==", newPin));
+            const pinSnap = await getDocs(qPin);
+
+            if (!pinSnap.empty) {
+                showToast('PIN นี้มีคนใช้แล้ว โปรดใช้เลขอื่น', 'error');
+                return; // หยุดการทำงาน
+            }
+
+            // 2. ถ้าไม่ซ้ำ ให้บันทึกรหัสใหม่
+            await updateDoc(doc(db, "users", currentUser.id), { 
+                pin: newPin, 
+                isFirstLogin: false 
+            });
+            
+            currentUser.pin = newPin; 
+            currentUser.isFirstLogin = false;
+            renderEmployeeDashboard(); 
+            navigateTo('view-employee');
+            await logActivity("Change_PIN", "ผู้ใช้เปลี่ยนรหัส PIN ใหม่ด้วยตนเอง");
             showToast('เปลี่ยนรหัสสำเร็จ', 'success');
         } catch (err) { showToast('บันทึกล้มเหลว', 'error'); }
     });
@@ -674,16 +714,27 @@
         const name = document.getElementById('emp-name').value;
         const pin = document.getElementById('emp-pin').value;
         try {
-    // เปลี่ยนจาก addDoc เป็น setDoc และใช้ name เป็นชื่อ Document
+            // 1. ตรวจสอบก่อนว่ามี PIN นี้ในระบบหรือยัง
+            const qPin = query(collection(db, "users"), where("pin", "==", pin));
+            const pinSnap = await getDocs(qPin);
+
+            if (!pinSnap.empty) {
+                showToast('PIN นี้มีผู้ใช้งานแล้ว โปรดตั้งเลขอื่น', 'error');
+                return; // หยุดการทำงาน ไม่บันทึกข้อมูล
+            }
+
+            // 2. ถ้าไม่ซ้ำ ให้บันทึกตามปกติ
             await setDoc(doc(db, "users", name), { 
                 name, 
                 pin, 
                 role: 'employee', 
                 isFirstLogin: true 
             });
+            
             document.getElementById('emp-name').value = ''; 
             document.getElementById('emp-pin').value = '';
-            showToast('เพิ่มพนักงานสำเร็จ (ใช้ชื่อเป็น ID)', 'success'); 
+            await logActivity("Admin_Add_Employee", `แอดมินเพิ่มพนักงานใหม่ชื่อ: ${name}`);
+            showToast('เพิ่มพนักงานสำเร็จ', 'success'); 
             renderAdminDashboard();
         } catch (err) { showToast('บันทึกล้มเหลว: ' + err.message, 'error'); }
     });
@@ -795,10 +846,18 @@
                 createdAt: new Date()
             };
 
+            // 1. บันทึกข้อมูลหลักก่อน
             await setDoc(doc(db, "training_records", nextId), data);
+            
+            // 2. บันทึก Log ตาม (ตรวจสอบว่า currentUser ไม่เป็น null)
+            if (currentUser) {
+                await logActivity("Add_Training", `เพิ่มประวัติการอบรม: ${data.course} (ID: ${nextId})`);
+            }
+            
+            // 3. ปิดหน้าต่างและแจ้งเตือน
             window.closeAddRecordModal(); 
-            showToast(`บันทึกแล้ว ID: ${nextId}`, 'success'); 
-            window.renderEmployeeDashboard();
+            showToast(`บันทึกสำเร็จ (ID: ${nextId})`, 'success'); 
+            await renderEmployeeDashboard(); // เพิ่ม await ตรงนี้เพื่อให้ข้อมูลอัปเดตทันที
         } catch (err) { showToast('ล้มเหลว: ' + err.message, 'error'); }
     });
 
@@ -892,20 +951,24 @@
                 date: document.getElementById('edit-record-date').value
             };
 
-            // ถ้าผู้ใช้เลือกไฟล์ใหม่ ให้ทำการแปลง/บีบอัดและใส่ในข้อมูลที่จะอัปเดต
+            // ถ้ามีการเลือกไฟล์ใหม่ ให้บีบอัดและอัปเดต
             if (fileInput.files.length > 0) {
                 const newFileBase64 = await fileToBase64(fileInput.files[0]);
                 updateData.fileUrl = newFileBase64;
             }
 
+            // 1. บันทึกการแก้ไขลง Firestore
             await updateDoc(doc(db, "training_records", editingRecordId), updateData);
             
+            // 2. บันทึก Log กิจกรรม (เพื่อให้ collection activity_logs ปรากฏขึ้น)
+            await logActivity("Edit_Training", `แก้ไขข้อมูลการอบรม ID: ${editingRecordId}`);
+
             document.getElementById('modal-edit-record').classList.add('hidden');
-            showToast('แก้ไขประวัติและไฟล์สำเร็จ', 'success'); 
-            renderEmployeeDashboard();
+            showToast('แก้ไขข้อมูลสำเร็จ', 'success'); 
+            await renderEmployeeDashboard();
         } catch (err) { 
             console.error(err);
-            showToast('แก้ไขไม่สำเร็จ: ' + err.message, 'error'); 
+            showToast('แก้ไขล้มเหลว: ' + err.message, 'error'); 
         }
     };
 
@@ -937,6 +1000,7 @@
         Object.assign(currentUser, updateData);
         document.getElementById('modal-edit-profile').classList.add('hidden');
         renderEmployeeDashboard(); 
+        await logActivity("Update_Profile", `อัปเดตข้อมูลส่วนตัว/รูปโปรไฟล์`);
         showToast('อัปเดตสำเร็จ', 'success');
     };
 
